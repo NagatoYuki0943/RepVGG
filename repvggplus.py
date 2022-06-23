@@ -4,6 +4,9 @@ from se_block import SEBlock
 import torch
 import numpy as np
 
+#----------------------------------#
+#   conv+bn+relu
+#----------------------------------#
 def conv_bn_relu(in_channels, out_channels, kernel_size, stride, padding, groups=1):
     result = nn.Sequential()
     result.add_module('conv', nn.Conv2d(in_channels=in_channels, out_channels=out_channels,
@@ -12,6 +15,9 @@ def conv_bn_relu(in_channels, out_channels, kernel_size, stride, padding, groups
     result.add_module('relu', nn.ReLU())
     return result
 
+#----------------------------------#
+#   conv+bn
+#----------------------------------#
 def conv_bn(in_channels, out_channels, kernel_size, stride, padding, groups=1):
     result = nn.Sequential()
     result.add_module('conv', nn.Conv2d(in_channels=in_channels, out_channels=out_channels,
@@ -35,28 +41,31 @@ class RepVGGplusBlock(nn.Module):
 
         self.nonlinearity = nn.ReLU()
 
+        # 主分支使用se
         if use_post_se:
             self.post_se = SEBlock(out_channels, internal_neurons=out_channels // 4)
         else:
             self.post_se = nn.Identity()
 
+        # 部署时使用合并后的3x3卷积
         if deploy:
             self.rbr_reparam = nn.Conv2d(in_channels=in_channels, out_channels=out_channels, kernel_size=kernel_size, stride=stride,
                                       padding=padding, dilation=dilation, groups=groups, bias=True, padding_mode=padding_mode)
+        # 训练时使用identity，3x3卷积和1x1卷积
         else:
-            if out_channels == in_channels and stride == 1:
-                self.rbr_identity = nn.BatchNorm2d(num_features=out_channels)
-            else:
-                self.rbr_identity = None
-            self.rbr_dense = conv_bn(in_channels=in_channels, out_channels=out_channels, kernel_size=kernel_size, stride=stride, padding=padding, groups=groups)
-            padding_11 = padding - kernel_size // 2
-            self.rbr_1x1 = conv_bn(in_channels=in_channels, out_channels=out_channels, kernel_size=1, stride=stride, padding=padding_11, groups=groups)
+            # identity只在宽高和通道都不变时才使用
+            self.rbr_identity = nn.BatchNorm2d(num_features=in_channels) if out_channels == in_channels and stride == 1 else None
+            self.rbr_dense    = conv_bn(in_channels=in_channels, out_channels=out_channels, kernel_size=kernel_size, stride=stride, padding=padding, groups=groups)
+            # 1x1卷积padding=0
+            padding_11        = padding - kernel_size // 2
+            self.rbr_1x1      = conv_bn(in_channels=in_channels, out_channels=out_channels, kernel_size=1, stride=stride, padding=padding_11, groups=groups)
 
     def forward(self, x, L2):
-
+        # 部署时使用合并后的3x3卷积
         if self.deploy:
             return self.post_se(self.nonlinearity(self.rbr_reparam(x))), None
 
+        # 不使用identity时直接加0
         if self.rbr_identity is None:
             id_out = 0
         else:
@@ -77,31 +86,44 @@ class RepVGGplusBlock(nn.Module):
         return out, L2 + l2_loss_circle + l2_loss_eq_kernel
 
 
+    #--------------------------------------------------------------------------------#
+    #   合并3条分支的卷积和bn，返回kernel和bias
     #   This func derives the equivalent kernel and bias in a DIFFERENTIABLE way.
     #   You can get the equivalent kernel and bias at any time and do whatever you want,
     #   for example, apply some penalties or constraints during training, just like you do to the other models.
     #   May be useful for quantization or pruning.
+    #--------------------------------------------------------------------------------#
     def get_equivalent_kernel_bias(self):
         kernel3x3, bias3x3 = self._fuse_bn_tensor(self.rbr_dense)
         kernel1x1, bias1x1 = self._fuse_bn_tensor(self.rbr_1x1)
         kernelid, biasid = self._fuse_bn_tensor(self.rbr_identity)
+        # 三条分支的卷积和bn参数分别相加
         return kernel3x3 + self._pad_1x1_to_3x3_tensor(kernel1x1) + kernelid, bias3x3 + bias1x1 + biasid
 
+    #----------------------#
+    #   1x1卷积填充为3x3
+    #----------------------#
     def _pad_1x1_to_3x3_tensor(self, kernel1x1):
         if kernel1x1 is None:
             return 0
         else:
             return torch.nn.functional.pad(kernel1x1, [1, 1, 1, 1])
 
+    #--------------------------------------------#
+    #   合并1条分支的卷积和bn，返回kernel和bias
+    #--------------------------------------------#
     def _fuse_bn_tensor(self, branch):
+        # rbr_identity分支在形状变化时为None
         if branch is None:
             return 0, 0
+        # conv1x1和conv3x3
         if isinstance(branch, nn.Sequential):
             #   For the 1x1 or 3x3 branch
             kernel, running_mean, running_var, gamma, beta, eps = branch.conv.weight, branch.bn.running_mean, branch.bn.running_var, branch.bn.weight, branch.bn.bias, branch.bn.eps
         else:
-            #   For the identity branch
+            # identity分支只有一个bn
             assert isinstance(branch, nn.BatchNorm2d)
+            # 创建中心为1，周围为0的3x3卷积核，这样经过卷积后值不变
             if not hasattr(self, 'id_tensor'):
                 #   Construct and store the identity kernel in case it is used multiple times
                 input_dim = self.in_channels // self.groups
@@ -110,14 +132,20 @@ class RepVGGplusBlock(nn.Module):
                     kernel_value[i, i % input_dim, 1, 1] = 1
                 self.id_tensor = torch.from_numpy(kernel_value).to(branch.weight.device)
             kernel, running_mean, running_var, gamma, beta, eps = self.id_tensor, branch.running_mean, branch.running_var, branch.weight, branch.bias, branch.eps
-        std = (running_var + eps).sqrt()
-        t = (gamma / std).reshape(-1, 1, 1, 1)
+        std = (running_var + eps).sqrt()        # 标准差
+        t = (gamma / std).reshape(-1, 1, 1, 1)  # γ
         return kernel * t, beta - running_mean * gamma / std
 
+    #-------------------#
+    #   模型部署
+    #-------------------#
     def switch_to_deploy(self):
+        # 有这个参数说明已经部署了
         if hasattr(self, 'rbr_reparam'):
             return
+        # 合并三条分支的卷积和bn
         kernel, bias = self.get_equivalent_kernel_bias()
+        # 创建新的卷积将获得的kernel和bias放入其中
         self.rbr_reparam = nn.Conv2d(in_channels=self.rbr_dense.conv.in_channels,
                                      out_channels=self.rbr_dense.conv.out_channels,
                                      kernel_size=self.rbr_dense.conv.kernel_size, stride=self.rbr_dense.conv.stride,
@@ -125,6 +153,7 @@ class RepVGGplusBlock(nn.Module):
                                      groups=self.rbr_dense.conv.groups, bias=True)
         self.rbr_reparam.weight.data = kernel
         self.rbr_reparam.bias.data = bias
+        # 删除不用的值,效果和 del self.属性，delattr(self, '属性名') 相同
         self.__delattr__('rbr_dense')
         self.__delattr__('rbr_1x1')
         if hasattr(self, 'rbr_identity'):
@@ -134,19 +163,23 @@ class RepVGGplusBlock(nn.Module):
         self.deploy = True
 
 
-
+#-------------------#
+#   创建每个stage
+#-------------------#
 class RepVGGplusStage(nn.Module):
 
-    def __init__(self, in_planes, planes, num_blocks, stride, use_checkpoint, use_post_se=False, deploy=False):
+    def __init__(self, in_channels, out_channels, num_blocks, stride, use_checkpoint, use_post_se=False, deploy=False):
+
         super().__init__()
+        # 第一次stride=2,后面为1
         strides = [stride] + [1] * (num_blocks - 1)
         blocks = []
-        self.in_planes = in_planes
+        self.in_channels = in_channels
         for stride in strides:
             cur_groups = 1
-            blocks.append(RepVGGplusBlock(in_channels=self.in_planes, out_channels=planes, kernel_size=3,
+            blocks.append(RepVGGplusBlock(in_channels=self.in_channels, out_channels=out_channels, kernel_size=3,
                                       stride=stride, padding=1, groups=cur_groups, deploy=deploy, use_post_se=use_post_se))
-            self.in_planes = planes
+            self.in_channels = out_channels
         self.blocks = nn.ModuleList(blocks)
         self.use_checkpoint = use_checkpoint
 
@@ -166,39 +199,57 @@ class RepVGGplus(nn.Module):
                  deploy=False,
                  use_post_se=False,
                  use_checkpoint=False):
+        """
+
+        Args:
+            num_blocks (list):                  stage2~5的重复次数
+            num_classes (int, optional):        最终分类数. Defaults to 1000.
+            width_multiplier (list, optional):  stage2~5的宽度. Defaults to None.
+            override_groups_map (_type_, optional): . Defaults to None.
+            deploy (bool, optional):            是否是部署模型. Defaults to False.
+            use_post_se (bool, optional):       是否使用激活函数. Defaults to False.
+            use_checkpoint (bool, optional):    . Defaults to False.
+        """
         super().__init__()
 
-        self.deploy = deploy
+        self.deploy              = deploy
         self.override_groups_map = override_groups_map or dict()
-        self.use_post_se = use_post_se
-        self.use_checkpoint = use_checkpoint
-        self.num_classes = num_classes
-        self.nonlinear = 'relu'
+        self.use_post_se         = use_post_se
+        self.use_checkpoint      = use_checkpoint
+        self.num_classes         = num_classes
+        self.nonlinear           = 'relu'
 
-        self.in_planes = min(64, int(64 * width_multiplier[0]))
-        self.stage0 = RepVGGplusBlock(in_channels=3, out_channels=self.in_planes, kernel_size=3, stride=2, padding=1, deploy=self.deploy, use_post_se=use_post_se)
+        self.in_channels   = min(64, int(64 * width_multiplier[0]))
+        self.stage0        = RepVGGplusBlock(in_channels=3, out_channels=self.in_channels, kernel_size=3, stride=2, padding=1, deploy=self.deploy, use_post_se=use_post_se)
         self.cur_layer_idx = 1
-        self.stage1 = RepVGGplusStage(self.in_planes, int(64 * width_multiplier[0]), num_blocks[0], stride=2, use_checkpoint=use_checkpoint, use_post_se=use_post_se, deploy=deploy)
-        self.stage2 = RepVGGplusStage(int(64 * width_multiplier[0]), int(128 * width_multiplier[1]), num_blocks[1], stride=2, use_checkpoint=use_checkpoint, use_post_se=use_post_se, deploy=deploy)
+        self.stage1        = RepVGGplusStage(self.in_channels,               int(64 * width_multiplier[0]),  num_blocks[0], stride=2, use_checkpoint=use_checkpoint, use_post_se=use_post_se, deploy=deploy)
+        self.stage2        = RepVGGplusStage(int(64 * width_multiplier[0]),  int(128 * width_multiplier[1]), num_blocks[1], stride=2, use_checkpoint=use_checkpoint, use_post_se=use_post_se, deploy=deploy)
+
         #   split stage3 so that we can insert an auxiliary classifier
-        self.stage3_first = RepVGGplusStage(int(128 * width_multiplier[1]), int(256 * width_multiplier[2]), num_blocks[2] // 2, stride=2, use_checkpoint=use_checkpoint, use_post_se=use_post_se, deploy=deploy)
+        self.stage3_first  = RepVGGplusStage(int(128 * width_multiplier[1]), int(256 * width_multiplier[2]), num_blocks[2] // 2, stride=2, use_checkpoint=use_checkpoint, use_post_se=use_post_se, deploy=deploy)
         self.stage3_second = RepVGGplusStage(int(256 * width_multiplier[2]), int(256 * width_multiplier[2]), num_blocks[2] // 2, stride=1, use_checkpoint=use_checkpoint, use_post_se=use_post_se, deploy=deploy)
-        self.stage4 = RepVGGplusStage(int(256 * width_multiplier[2]), int(512 * width_multiplier[3]), num_blocks[3], stride=2, use_checkpoint=use_checkpoint, use_post_se=use_post_se, deploy=deploy)
-        self.gap = nn.AdaptiveAvgPool2d(output_size=1)
-        self.linear = nn.Linear(int(512 * width_multiplier[3]), num_classes)
+        self.stage4        = RepVGGplusStage(int(256 * width_multiplier[2]), int(512 * width_multiplier[3]), num_blocks[3],      stride=2, use_checkpoint=use_checkpoint, use_post_se=use_post_se, deploy=deploy)
+        self.gap           = nn.AdaptiveAvgPool2d(output_size=1)
+        self.linear        = nn.Linear(int(512 * width_multiplier[3]), num_classes)
+
         #   aux classifiers
         if not self.deploy:
-            self.stage1_aux = self._build_aux_for_stage(self.stage1)
-            self.stage2_aux = self._build_aux_for_stage(self.stage2)
+            self.stage1_aux       = self._build_aux_for_stage(self.stage1)
+            self.stage2_aux       = self._build_aux_for_stage(self.stage2)
             self.stage3_first_aux = self._build_aux_for_stage(self.stage3_first)
 
+    #----------------------#
+    #   创建辅助分支
+    #   下采样conv+pool+flatten+fc
+    #----------------------#
     def _build_aux_for_stage(self, stage):
         stage_out_channels = list(stage.blocks.children())[-1].rbr_dense.conv.out_channels
-        downsample = conv_bn_relu(in_channels=stage_out_channels, out_channels=stage_out_channels, kernel_size=3, stride=2, padding=1)
-        fc = nn.Linear(stage_out_channels, self.num_classes, bias=True)
+        downsample         = conv_bn_relu(in_channels=stage_out_channels, out_channels=stage_out_channels, kernel_size=3, stride=2, padding=1)
+        fc                 = nn.Linear(stage_out_channels, self.num_classes, bias=True)
         return nn.Sequential(downsample, nn.AdaptiveAvgPool2d(1), nn.Flatten(), fc)
 
     def forward(self, x):
+        # 部署阶段只有out返回值
         if self.deploy:
             out, _ = self.stage0(x, L2=None)
             out, _ = self.stage1(out, L2=None)
@@ -206,24 +257,25 @@ class RepVGGplus(nn.Module):
             out, _ = self.stage3_first(out, L2=None)
             out, _ = self.stage3_second(out, L2=None)
             out, _ = self.stage4(out, L2=None)
-            y = self.gap(out)
-            y = y.view(y.size(0), -1)
-            y = self.linear(y)
+            y      = self.gap(out)
+            y      = y.view(y.size(0), -1)
+            y      = self.linear(y)
             return y
 
+        # 训练阶段有多个输出
         else:
-            out, L2 = self.stage0(x, L2=0.0)
-            out, L2 = self.stage1(out, L2=L2)
+            out, L2    = self.stage0(x, L2=0.0)
+            out, L2    = self.stage1(out, L2=L2)
             stage1_aux = self.stage1_aux(out)
-            out, L2 = self.stage2(out, L2=L2)
+            out, L2    = self.stage2(out, L2=L2)
             stage2_aux = self.stage2_aux(out)
-            out, L2 = self.stage3_first(out, L2=L2)
+            out, L2    = self.stage3_first(out, L2=L2)
             stage3_first_aux = self.stage3_first_aux(out)
-            out, L2 = self.stage3_second(out, L2=L2)
-            out, L2 = self.stage4(out, L2=L2)
-            y = self.gap(out)
-            y = y.view(y.size(0), -1)
-            y = self.linear(y)
+            out, L2    = self.stage3_second(out, L2=L2)
+            out, L2    = self.stage4(out, L2=L2)
+            y          = self.gap(out)
+            y          = y.view(y.size(0), -1)
+            y          = self.linear(y)
             return {
                 'main': y,
                 'stage1_aux': stage1_aux,
@@ -252,11 +304,22 @@ class RepVGGplus(nn.Module):
 #   pse for "post SE", which means using SE block after ReLU
 def create_RepVGGplus_L2pse(deploy=False, use_checkpoint=False):
     return RepVGGplus(num_blocks=[8, 14, 24, 1], num_classes=1000,
-                  width_multiplier=[2.5, 2.5, 2.5, 5], override_groups_map=None, deploy=deploy, use_post_se=True,
+                      width_multiplier=[2.5, 2.5, 2.5, 5], override_groups_map=None, deploy=deploy, use_post_se=True,
                       use_checkpoint=use_checkpoint)
 
 repvggplus_func_dict = {
-'RepVGGplus-L2pse': create_RepVGGplus_L2pse,
+    'RepVGGplus-L2pse': create_RepVGGplus_L2pse,
 }
 def get_RepVGGplus_func_by_name(name):
     return repvggplus_func_dict[name]
+
+
+if __name__ == '__main__':
+    x = torch.randn(1, 3, 224, 224)
+    model = create_RepVGGplus_L2pse()
+    model.linear = nn.Linear(model.linear.in_features, 10)
+    # torch.onnx.export(model, x, "RepVGGplus_L2pse.onnx", input_names=['input'], output_names=['out'], opset_version=15)
+    print(model)
+
+    y = model(x)
+    print(y['main'].size()) # [1, 10]

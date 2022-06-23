@@ -26,9 +26,6 @@ class RepVGGBlock(nn.Module):
         assert kernel_size == 3
         assert padding == 1
 
-        # 1x1卷积padding=0
-        padding_11 = padding - kernel_size // 2
-
         self.nonlinearity = nn.ReLU()
 
         # 主分支使用se
@@ -46,6 +43,8 @@ class RepVGGBlock(nn.Module):
             # identity只在宽高和通道都不变时才使用
             self.rbr_identity = nn.BatchNorm2d(num_features=in_channels) if out_channels == in_channels and stride == 1 else None
             self.rbr_dense    = conv_bn(in_channels=in_channels, out_channels=out_channels, kernel_size=kernel_size, stride=stride, padding=padding, groups=groups)
+            # 1x1卷积padding=0
+            padding_11        = padding - kernel_size // 2
             self.rbr_1x1      = conv_bn(in_channels=in_channels, out_channels=out_channels, kernel_size=1, stride=stride, padding=padding_11, groups=groups)
             print('RepVGG Block, identity = ', self.rbr_identity)
 
@@ -108,8 +107,10 @@ class RepVGGBlock(nn.Module):
     #   合并1条分支的卷积和bn，返回kernel和bias
     #--------------------------------------------#
     def _fuse_bn_tensor(self, branch):
+        # rbr_identity分支在形状变化时为None
         if branch is None:
             return 0, 0
+        # conv1x1和conv3x3
         if isinstance(branch, nn.Sequential):
             kernel = branch.conv.weight
             running_mean = branch.bn.running_mean
@@ -133,8 +134,8 @@ class RepVGGBlock(nn.Module):
             gamma = branch.weight
             beta = branch.bias
             eps = branch.eps
-        std = (running_var + eps).sqrt()
-        t = (gamma / std).reshape(-1, 1, 1, 1)
+        std = (running_var + eps).sqrt()        # 标准差
+        t = (gamma / std).reshape(-1, 1, 1, 1)  # γ
         return kernel * t, beta - running_mean * gamma / std
 
     #-------------------#
@@ -154,7 +155,7 @@ class RepVGGBlock(nn.Module):
         self.rbr_reparam.bias.data = bias
         for para in self.parameters():
             para.detach_()
-        # 删除不用的值
+        # 删除不用的值,效果和 del self.属性，delattr(self, '属性名') 相同
         self.__delattr__('rbr_dense')
         self.__delattr__('rbr_1x1')
         if hasattr(self, 'rbr_identity'):
@@ -171,12 +172,12 @@ class RepVGG(nn.Module):
         """
 
         Args:
-            num_blocks (list): stage2~5的重复次数
-            num_classes (int, optional): 最终分类数. Defaults to 1000.
-            width_multiplier (list, optional): stage2~5的宽度. Defaults to None.
+            num_blocks (list):                  stage2~5的重复次数
+            num_classes (int, optional):        最终分类数. Defaults to 1000.
+            width_multiplier (list, optional):  stage2~5的宽度. Defaults to None.
             override_groups_map (_type_, optional): . Defaults to None.
-            deploy (bool, optional): 是否是部署模型. Defaults to False.
-            use_se (bool, optional): 是否使用激活函数. Defaults to False.
+            deploy (bool, optional):            是否是部署模型. Defaults to False.
+            use_se (bool, optional):            是否使用激活函数. Defaults to False.
         """
         super(RepVGG, self).__init__()
 
@@ -356,10 +357,13 @@ if __name__ == '__main__':
     x = torch.randn(1, 3, 224, 224)
     model = create_RepVGG_A1()
     model.linear = nn.Linear(model.linear.in_features, 10)
+    model.eval()
     # print(model)
+    # torch.onnx.export(model, x, "create_RepVGG_A1.onnx", input_names=['input'], output_names=['out'], opset_version=15)
 
     model = repvgg_model_convert(model)
     print(model)
+    # storch.onnx.export(model, x, "create_RepVGG_A1_deploy.onnx", input_names=['input'], output_names=['out'], opset_version=15)
 
     y = model(x)
     print(y.size()) # [1, 10]
