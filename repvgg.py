@@ -95,7 +95,7 @@ class RepVGGBlock(nn.Module):
         return kernel3x3   + self._pad_1x1_to_3x3_tensor(kernel1x1) + kernelid, bias3x3 + bias1x1 + biasid
 
     #----------------------#
-    #   1x1卷积填充为3x3
+    #   1x1conv填充为3x3conv
     #----------------------#
     def _pad_1x1_to_3x3_tensor(self, kernel1x1):
         if kernel1x1 is None:
@@ -135,7 +135,7 @@ class RepVGGBlock(nn.Module):
             beta = branch.bias
             eps = branch.eps
         std = (running_var + eps).sqrt()        # 标准差
-        t = (gamma / std).reshape(-1, 1, 1, 1)  # γ
+        t = (gamma / std).reshape(-1, 1, 1, 1)  # \frac{\gamma}{\sqrt{var}}  gamma/std
         return kernel * t, beta - running_mean * gamma / std
 
     #-------------------#
