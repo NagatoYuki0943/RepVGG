@@ -227,7 +227,7 @@ class RepVGG(nn.Module):
             cur_groups = self.override_groups_map.get(self.cur_layer_idx, 1)
             blocks.append(RepVGGBlock(in_channels=self.in_planes, out_channels=planes, kernel_size=3,
                                       stride=stride, padding=1, groups=cur_groups, deploy=self.deploy, use_se=self.use_se))
-            self.in_channels = planes
+            self.in_planes = planes
             self.cur_layer_idx += 1
         return nn.ModuleList(blocks)
 
@@ -288,7 +288,6 @@ def create_RepVGG_B2g2(deploy=False, use_checkpoint=False):
 def create_RepVGG_B2g4(deploy=False, use_checkpoint=False):
     return RepVGG(num_blocks=[4, 6, 16, 1], num_classes=1000,
                   width_multiplier=[2.5, 2.5, 2.5, 5], override_groups_map=g4_map, deploy=deploy, use_checkpoint=use_checkpoint)
-
 
 def create_RepVGG_B3(deploy=False, use_checkpoint=False):
     return RepVGG(num_blocks=[4, 6, 16, 1], num_classes=1000,
@@ -364,8 +363,9 @@ if __name__ == '__main__':
     # torch.onnx.export(model, x, "create_RepVGG_A1.onnx", input_names=['input'], output_names=['out'], opset_version=15)
 
     model = repvgg_model_convert(model)
-    print(model)
-    # storch.onnx.export(model, x, "create_RepVGG_A1_deploy.onnx", input_names=['input'], output_names=['out'], opset_version=15)
+    # print(model)
+    # torch.onnx.export(model, x, "create_RepVGG_A1_deploy.onnx", input_names=['input'], output_names=['out'], opset_version=15)
 
-    y = model(x)
+    with torch.inference_mode():
+        y = model(x)
     print(y.size()) # [1, 10]

@@ -343,7 +343,9 @@ if __name__ == '__main__':
     model = create_RepVGGplus_L2pse()
     model.linear = nn.Linear(model.linear.in_features, 10)
     # torch.onnx.export(model, x, "RepVGGplus_L2pse.onnx", input_names=['input'], output_names=['out'], opset_version=15)
-    print(model)
+    # print(model)
 
-    y = model(x)
+    model.eval()
+    with torch.inference_mode():
+        y = model(x)
     print(y['main'].size()) # [1, 10]
